@@ -7,3 +7,5 @@ BraTS2020_training_data/
 Model_checkpoints/
 old-stuff/
 WIP/
+.DS_Store
+
