@@ -1,0 +1,9 @@
+#ignore 
+__pycache__/
+.html notebooks/
+.vscode/
+brats20-dataset-training-validation/
+BraTS2020_training_data/
+Model_checkpoints/
+old-stuff/
+WIP/
