@@ -9,3 +9,13 @@ old-stuff/
 WIP/
 .DS_Store
 
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Python
+__pycache__/
+*.pyc
+
+# PyTorch checkpoints
+*.pth

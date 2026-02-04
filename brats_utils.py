@@ -1,33 +1,26 @@
 """
-FAST BraTS Dataset - Uses preprocessed .npy files
+FAST BraTS Dataset - Model 5 Optimized
 
-This is 10-50x faster than loading from .nii files because:
-1. .npy files are already extracted slices (no 3D volume loading)
-2. .npy files are uncompressed (no decompression overhead)
-3. .npy files are memory-mapped friendly
+Key optimization: Augmentation moved to GPU (in training loop)
+- Dataset only does: load .npy + normalize (fast)
+- Augmentation done on GPU after .to(device) (essentially free)
 
-Usage:
-    # First run preprocessing (once):
-    python preprocess_to_npy.py --data_root /path/to/raw --output_dir /path/to/preprocessed
-    
-    # Then use this dataset:
-    from brats_utils_fast import BraTSFastDataset
-    train_dataset = BraTSFastDataset('/path/to/preprocessed', split='train', augment=True)
+This fixes the 7 it/s → 2 it/s slowdown caused by CPU-bound scipy.rotate
 """
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset, WeightedRandomSampler
 from pathlib import Path
 import numpy as np
 import json
-from scipy.ndimage import rotate
 
 
 class BraTSFastDataset(Dataset):
     """
-    Fast BraTS dataset that loads preprocessed .npy files
+    Fast BraTS dataset - NO CPU AUGMENTATION
     
-    Expected speedup: 10-50x compared to loading .nii files
+    Augmentation is done on GPU via gpu_augment() function
     """
     
     def __init__(self, preprocessed_dir: str, split: str = 'train', augment: bool = False):
@@ -35,11 +28,15 @@ class BraTSFastDataset(Dataset):
         Args:
             preprocessed_dir: Path to directory with preprocessed .npy files
             split: 'train', 'val', or 'test'
-            augment: Whether to apply data augmentation
+            augment: IGNORED - augmentation now done on GPU in training loop
         """
         self.preprocessed_dir = Path(preprocessed_dir)
-        self.augment = augment
         self.split = split
+        
+        # Note: augment parameter is kept for API compatibility but ignored
+        # Augmentation should be done on GPU using gpu_augment() function
+        if augment:
+            print("  Note: CPU augmentation disabled. Use gpu_augment() in training loop instead.")
         
         # Load metadata for this split
         metadata_path = self.preprocessed_dir / f'{split}_metadata.json'
@@ -76,59 +73,28 @@ class BraTSFastDataset(Dataset):
         if img.ndim == 2:
             img = img[np.newaxis, ...]  # Add channel dim: (H, W) -> (1, H, W)
         
-        # Apply augmentation if enabled
-        if self.augment:
-            img, mask = self._augment(img, mask)
+        # Vectorized Z-Score normalization (FAST - no Python loops)
+        # Compute mean and std for all channels at once
+        img = img.astype(np.float32)
         
-        # Z-Score normalize each channel independently
-        for c in range(img.shape[0]):
-            channel = img[c]
-            if np.std(channel) > 0:
-                img[c] = (channel - np.mean(channel)) / np.std(channel)
-            else:
-                img[c] = 0
+        # Per-channel normalization using numpy broadcasting
+        # Shape: (C, H, W) -> compute stats over (H, W) for each channel
+        means = img.mean(axis=(1, 2), keepdims=True)  # (C, 1, 1)
+        stds = img.std(axis=(1, 2), keepdims=True)    # (C, 1, 1)
+        stds = np.maximum(stds, 1e-8)  # Avoid division by zero
+        img = (img - means) / stds
         
         # Ensure mask values are clean (0, 1, 2, 3)
         mask = np.clip(np.round(mask), 0, 3).astype(np.int64)
         
-        # Convert to tensors
-        img_tensor = torch.from_numpy(img.copy()).float()
-        mask_tensor = torch.from_numpy(mask.copy()).long()
+        # Convert to tensors - use np.ascontiguousarray to avoid extra copy
+        img_tensor = torch.from_numpy(np.ascontiguousarray(img)).float()
+        mask_tensor = torch.from_numpy(np.ascontiguousarray(mask)).long()
         
         return img_tensor, mask_tensor
     
-    def _augment(self, img, mask):
-        """
-        Apply data augmentation
-        
-        Args:
-            img: (C, H, W) numpy array
-            mask: (H, W) numpy array
-        """
-        # Random rotation between -15 and +15 degrees
-        if np.random.rand() > 0.5:
-            angle = np.random.uniform(-15, 15)
-            # Rotate each channel
-            for c in range(img.shape[0]):
-                img[c] = rotate(img[c], angle, reshape=False, order=1, mode='nearest')
-            mask = rotate(mask, angle, reshape=False, order=0, mode='nearest')
-        
-        # Random horizontal flip
-        if np.random.rand() > 0.5:
-            img = np.flip(img, axis=2).copy()  # Flip along W dimension
-            mask = np.flip(mask, axis=1).copy()
-        
-        return img, mask
-    
     def get_sample_weights(self, tumor_oversample_factor: float = 5.0):
-        """
-        Get weights for WeightedRandomSampler to oversample tumor slices
-        
-        Usage:
-            weights = dataset.get_sample_weights(tumor_oversample_factor=5.0)
-            sampler = WeightedRandomSampler(weights, len(weights), replacement=True)
-            dataloader = DataLoader(dataset, batch_size=16, sampler=sampler)
-        """
+        """Get weights for WeightedRandomSampler to oversample tumor slices"""
         weights = []
         for slice_info in self.slices:
             if slice_info['has_tumor']:
@@ -138,14 +104,8 @@ class BraTSFastDataset(Dataset):
         return torch.tensor(weights, dtype=torch.float)
     
     def get_class_pixel_counts(self, max_samples: int = 1000):
-        """
-        Count pixels per class (for computing class weights)
-        
-        Args:
-            max_samples: Number of samples to count (for speed)
-        """
+        """Count pixels per class (for computing class weights)"""
         counts = np.zeros(4, dtype=np.int64)
-        
         indices = np.random.choice(len(self), min(max_samples, len(self)), replace=False)
         
         for idx in indices:
@@ -157,131 +117,180 @@ class BraTSFastDataset(Dataset):
         return counts
 
 
+# =============================================================================
+# GPU AUGMENTATION - Call this in training loop AFTER moving to device
+# =============================================================================
+
+def gpu_augment(images, masks, p_flip=0.5, p_rotate=0.5, max_angle=15):
+    """
+    Apply augmentation on GPU (FAST!)
+    
+    Call this in training loop:
+        images, masks = images.to(device), masks.to(device)
+        if training:
+            images, masks = gpu_augment(images, masks)
+    
+    Args:
+        images: (B, C, H, W) tensor on GPU
+        masks: (B, H, W) tensor on GPU  
+        p_flip: probability of horizontal flip
+        p_rotate: probability of rotation
+        max_angle: max rotation angle in degrees
+    
+    Returns:
+        augmented images and masks (same shapes)
+    """
+    B = images.shape[0]
+    device = images.device
+    
+    # Random horizontal flip (per-sample)
+    if p_flip > 0:
+        flip_mask = torch.rand(B, device=device) < p_flip
+        if flip_mask.any():
+            # Flip images: (B, C, H, W) -> flip along W (dim=3)
+            images[flip_mask] = torch.flip(images[flip_mask], dims=[3])
+            # Flip masks: (B, H, W) -> flip along W (dim=2)
+            masks[flip_mask] = torch.flip(masks[flip_mask], dims=[2])
+    
+    # Random rotation (per-sample)
+    if p_rotate > 0:
+        rotate_mask = torch.rand(B, device=device) < p_rotate
+        if rotate_mask.any():
+            # Generate random angles for samples that need rotation
+            angles = torch.zeros(B, device=device)
+            angles[rotate_mask] = torch.empty(rotate_mask.sum(), device=device).uniform_(-max_angle, max_angle)
+            
+            # Only rotate samples that need it
+            indices = torch.where(rotate_mask)[0]
+            for idx in indices:
+                angle = angles[idx].item()
+                images[idx] = _rotate_tensor(images[idx], angle)
+                masks[idx] = _rotate_mask(masks[idx], angle)
+    
+    return images, masks
+
+
+def _rotate_tensor(img, angle_deg):
+    """
+    Rotate a single image tensor on GPU
+    
+    Args:
+        img: (C, H, W) tensor
+        angle_deg: rotation angle in degrees
+    
+    Returns:
+        rotated (C, H, W) tensor
+    """
+    angle_rad = angle_deg * np.pi / 180
+    
+    # Create rotation matrix
+    cos_a = np.cos(angle_rad)
+    sin_a = np.sin(angle_rad)
+    
+    # Affine matrix for rotation around center
+    theta = torch.tensor([
+        [cos_a, -sin_a, 0],
+        [sin_a, cos_a, 0]
+    ], dtype=img.dtype, device=img.device).unsqueeze(0)  # (1, 2, 3)
+    
+    # Add batch dimension for grid_sample
+    img_4d = img.unsqueeze(0)  # (1, C, H, W)
+    
+    # Create sampling grid
+    grid = F.affine_grid(theta, img_4d.size(), align_corners=False)
+    
+    # Sample with bilinear interpolation
+    rotated = F.grid_sample(img_4d, grid, mode='bilinear', padding_mode='zeros', align_corners=False)
+    
+    return rotated.squeeze(0)  # Back to (C, H, W)
+
+
+def _rotate_mask(mask, angle_deg):
+    """
+    Rotate a single mask tensor on GPU (nearest neighbor interpolation)
+    
+    Args:
+        mask: (H, W) tensor (long dtype)
+        angle_deg: rotation angle in degrees
+    
+    Returns:
+        rotated (H, W) tensor
+    """
+    angle_rad = angle_deg * np.pi / 180
+    
+    cos_a = np.cos(angle_rad)
+    sin_a = np.sin(angle_rad)
+    
+    theta = torch.tensor([
+        [cos_a, -sin_a, 0],
+        [sin_a, cos_a, 0]
+    ], dtype=torch.float32, device=mask.device).unsqueeze(0)
+    
+    # Mask needs to be float for grid_sample, then convert back
+    mask_4d = mask.unsqueeze(0).unsqueeze(0).float()  # (1, 1, H, W)
+    
+    grid = F.affine_grid(theta, mask_4d.size(), align_corners=False)
+    
+    # Use nearest neighbor for masks to preserve integer labels
+    rotated = F.grid_sample(mask_4d, grid, mode='nearest', padding_mode='zeros', align_corners=False)
+    
+    return rotated.squeeze(0).squeeze(0).long()  # Back to (H, W)
+
+
+# =============================================================================
+# FAST GPU AUGMENTATION (BATCHED) - Even faster for large batches
+# =============================================================================
+
+def gpu_augment_fast(images, masks, p_flip=0.5):
+    """
+    Ultra-fast augmentation - flip only (rotation is slower even on GPU)
+    
+    For maximum throughput, use this instead of gpu_augment()
+    Rotation adds ~10-20% overhead; flip is essentially free
+    
+    Args:
+        images: (B, C, H, W) tensor on GPU
+        masks: (B, H, W) tensor on GPU
+        p_flip: probability of horizontal flip
+    
+    Returns:
+        augmented images and masks
+    """
+    B = images.shape[0]
+    device = images.device
+    
+    # Random horizontal flip
+    flip_mask = torch.rand(B, device=device) < p_flip
+    if flip_mask.any():
+        images[flip_mask] = torch.flip(images[flip_mask], dims=[3])
+        masks[flip_mask] = torch.flip(masks[flip_mask], dims=[2])
+    
+    return images, masks
+
+
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
+
 def create_weighted_sampler(dataset: BraTSFastDataset, tumor_oversample_factor: float = 5.0):
-    """
-    Convenience function to create a WeightedRandomSampler
-    """
+    """Convenience function to create a WeightedRandomSampler"""
     weights = dataset.get_sample_weights(tumor_oversample_factor)
     return WeightedRandomSampler(weights, len(weights), replacement=True)
 
 
 def compute_class_weights(dataset: BraTSFastDataset, max_samples: int = 1000):
-    """
-    Compute class weights inversely proportional to pixel frequency
-    
-    Returns weights suitable for nn.CrossEntropyLoss(weight=...)
-    """
+    """Compute class weights inversely proportional to pixel frequency"""
     counts = dataset.get_class_pixel_counts(max_samples)
     
     # Inverse frequency weighting
     total = counts.sum()
-    weights = total / (4 * counts + 1)  # +1 to avoid division by zero
+    weights = total / (4 * counts + 1)
     
     # Normalize so mean weight is 1
     weights = weights / weights.mean()
     
-    # Cap background weight (it's huge otherwise)
+    # Cap background weight
     weights[0] = min(weights[0], 0.5)
     
     print(f"Computed class weights: {weights}")
     return torch.tensor(weights, dtype=torch.float32)
-
-
-# ============================================================================
-# LEGACY DATASET (for comparison / if you don't want to preprocess)
-# ============================================================================
-
-class BraTSMultiClassDataset(Dataset):
-    """
-    Original slow dataset that loads from .nii files
-    
-    DEPRECATED: Use BraTSFastDataset instead for 10-50x speedup
-    """
-    def __init__(self, root_dir, start, stop, augment=False):
-        import nibabel as nib
-        self.nib = nib
-        
-        self.root_dir = Path(root_dir)
-        self.patient_folders = sorted(list(self.root_dir.glob("BraTS20_Training_*")))
-        self.valid_slices = []
-        self.augment = augment
-        self.start = start
-        
-        print("WARNING: Using slow dataset. Consider using BraTSFastDataset instead.")
-        print("Preprocessing: Scanning for ALL slices with brain tissue...")
-        
-        patients_to_process = self.patient_folders[start:stop]
-        tumor_count = 0
-        
-        for p_idx, path in enumerate(patients_to_process): 
-            patient_id = path.name
-            mask_path = path / f"{patient_id}_seg.nii"
-            img_path = path / f"{patient_id}_t1ce.nii"
-            
-            try:
-                mask_3d = nib.load(mask_path).get_fdata()
-                img_3d = nib.load(img_path).get_fdata()
-            except Exception as e:
-                print(f"Warning: Could not load data for {patient_id}: {e}")
-                continue
-            
-            for i in range(mask_3d.shape[2]):
-                img_slice = img_3d[:, :, i]
-                
-                if np.std(img_slice) > 0.1 and np.count_nonzero(img_slice) > 1000:
-                    has_tumor = np.sum(mask_3d[:, :, i]) > 0
-                    self.valid_slices.append((p_idx, i, has_tumor))
-                    if has_tumor:
-                        tumor_count += 1
-                    
-        print(f"Found {len(self.valid_slices)} valid slices")
-        print(f"  → {tumor_count} with tumor, {len(self.valid_slices) - tumor_count} without")
-
-    def __len__(self):
-        return len(self.valid_slices)
-
-    def __getitem__(self, index):
-        patient_idx, slice_idx, _ = self.valid_slices[index]
-        patient_path = self.patient_folders[self.start + patient_idx]
-        patient_id = patient_path.name
-        
-        img_path = patient_path / f"{patient_id}_t1ce.nii"
-        mask_path = patient_path / f"{patient_id}_seg.nii"
-        
-        # SLOW: Loading entire 3D volume just for one slice
-        img_slice = self.nib.load(img_path).get_fdata()[:, :, slice_idx]
-        mask_slice = self.nib.load(mask_path).get_fdata()[:, :, slice_idx]
-        
-        if self.augment:
-            img_slice, mask_slice = self._augment(img_slice, mask_slice)
-        
-        if np.std(img_slice) > 0:
-            img_slice = (img_slice - np.mean(img_slice)) / np.std(img_slice)
-        else:
-            img_slice = img_slice * 0
-        
-        mask_slice[mask_slice == 4] = 3
-        mask_slice = np.clip(np.round(mask_slice), 0, 3).astype(np.int64)
-        
-        img_tensor = torch.from_numpy(img_slice.copy()).float().unsqueeze(0)
-        mask_tensor = torch.from_numpy(mask_slice.copy()).long()
-        
-        return img_tensor, mask_tensor
-    
-    def _augment(self, img, mask):
-        if np.random.rand() > 0.5:
-            angle = np.random.uniform(-15, 15)
-            img = rotate(img, angle, reshape=False, order=1, mode='nearest')
-            mask = rotate(mask, angle, reshape=False, order=0, mode='nearest')
-        
-        if np.random.rand() > 0.5:
-            img = np.fliplr(img).copy()
-            mask = np.fliplr(mask).copy()
-        
-        return img, mask
-    
-    def get_sample_weights(self, tumor_oversample_factor=5.0):
-        weights = []
-        for _, _, has_tumor in self.valid_slices:
-            weights.append(tumor_oversample_factor if has_tumor else 1.0)
-        return torch.tensor(weights, dtype=torch.float)
